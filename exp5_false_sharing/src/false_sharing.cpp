@@ -48,6 +48,10 @@ static constexpr double    GHZ    = 3.33;   // M2 Max P-core frequency
 // alignas(128) ensures counter_a starts on a cache-line boundary.
 // counter_b follows immediately at offset +8, within the same 128-byte block.
 // A store to either counter invalidates the line in all other cores' caches.
+// struct alignas(128) Adjacent {
+//     std::atomic<uint64_t> a{1};
+//     std::atomic<uint64_t> b{1};
+// };
 struct alignas(128) Adjacent {
     std::atomic<uint64_t> a{1};
     std::atomic<uint64_t> b{1};
@@ -57,6 +61,12 @@ struct alignas(128) Adjacent {
 // _pad fills the remainder of counter_a's cache line (128 - 8 = 120 bytes).
 // counter_b begins at offset +128, on a new 128-byte-aligned cache line.
 // A store to counter_b never invalidates the cache line holding counter_a.
+// struct alignas(128) Padded {
+//     std::atomic<uint64_t> a{1};
+//     char                  _pad[120];
+//     std::atomic<uint64_t> b{1};
+// };
+
 struct alignas(128) Padded {
     std::atomic<uint64_t> a{1};
     char                  _pad[120];
@@ -100,10 +110,14 @@ static void run_case1() {
 
     // Touch both counters during warmup to bring their shared cache line into L1d.
     for (long long i = 0; i < WARMUP; i++) {
-        uint64_t v = s.a.load(std::memory_order_relaxed);
-        s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
-        uint64_t u = s.b.load(std::memory_order_relaxed);
-        s.b.store(u * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+        // uint64_t v = s.a.load(std::memory_order_relaxed);
+        // s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+        // uint64_t u = s.b.load(std::memory_order_relaxed);
+        // s.b.store(u * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+        uint64_t v = s.a.load(std::memory_order_seq_cst);
+        s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_seq_cst);
+        uint64_t u = s.b.load(std::memory_order_seq_cst);
+        s.b.store(u * LCG_MUL + LCG_INC, std::memory_order_seq_cst);
     }
     escape(&s);
 
@@ -116,8 +130,10 @@ static void run_case1() {
             // until iteration i's store is visible, because the next load
             // reads the value just written. This exposes true latency (not
             // throughput) — the same pointer-chasing technique used in exp3.
-            uint64_t v = s.a.load(std::memory_order_relaxed);
-            s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+            // uint64_t v = s.a.load(std::memory_order_relaxed);
+            // s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+            uint64_t v = s.a.load(std::memory_order_seq_cst);
+            s.a.store(v * LCG_MUL + LCG_INC, std::memory_order_seq_cst);
         }
         auto t1 = std::chrono::steady_clock::now();
         escape(&s);
@@ -152,11 +168,9 @@ static void run_multithreaded(const char* label, S& s) {
     double min_b = 1e18, sum_b = 0.0;
 
     auto worker = [&](std::atomic<uint64_t>& ctr, double& out_min, double& out_sum) {
-        // Warmup: bring counter into L1d before measurement begins.
-        // Unsynchronized — order between the two threads does not matter here.
         for (long long i = 0; i < WARMUP; i++) {
-            uint64_t v = ctr.load(std::memory_order_relaxed);
-            ctr.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+            uint64_t v = ctr.load(std::memory_order_seq_cst);
+            ctr.store(v * LCG_MUL + LCG_INC, std::memory_order_seq_cst);
         }
         escape(&ctr);
 
@@ -169,8 +183,8 @@ static void run_multithreaded(const char* label, S& s) {
 
             auto t0 = std::chrono::steady_clock::now();
             for (long long i = 0; i < N; i++) {
-                uint64_t v = ctr.load(std::memory_order_relaxed);
-                ctr.store(v * LCG_MUL + LCG_INC, std::memory_order_relaxed);
+                uint64_t v = ctr.load(std::memory_order_seq_cst);
+                ctr.store(v * LCG_MUL + LCG_INC, std::memory_order_seq_cst);
             }
             auto t1 = std::chrono::steady_clock::now();
             escape(&ctr);

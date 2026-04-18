@@ -1,257 +1,218 @@
-# Experiment 1: Dependent vs. Independent Instructions on Apple M2
+# Experiment 1: Instruction-Level Parallelism on Apple M2 — Notes
 
-## Execution Environment
+## 1. Experimental Design
+
+This experiment empirically measures the difference between **latency-bound** and
+**throughput-bound** execution on the Apple M2's out-of-order superscalar core, and
+builds direct intuition for Instruction-Level Parallelism (ILP).
+
+Two loop structures are compared:
+
+- **Dependent loop:** A single accumulator chain where each iteration reads the value
+  written by the previous iteration — a strict Read-After-Write (RAW) dependency. The
+  CPU cannot begin iteration N+1 until iteration N's result is available. ILP is not
+  exploitable within this chain.
+
+- **Independent loop:** Four separate accumulator chains with no shared inputs. Each
+  chain depends only on its own previous output. The CPU can theoretically dispatch all
+  four in parallel every cycle, filling multiple execution ports simultaneously.
+
+The key design challenge is constructing a workload that the compiler cannot eliminate
+or collapse into a trivial constant. This required three phases of iterative refinement,
+each revealing a different compiler optimisation that had to be designed around.
+
+**Why this matters for hardware intuition:** On a modern out-of-order CPU, instructions
+are dispatched to multiple execution units in parallel. A tight dependent chain forces
+sequential execution, limited by instruction latency. A wide independent workload can
+fill all available execution ports, limited instead by port throughput. The gap between
+these two regimes is the practical ceiling on ILP gain — and understanding what limits
+that ceiling (latency, port pressure, loop control overhead, or compiler artefacts) is
+the central question of this experiment.
 
 | Property | Value |
 |---|---|
-| OS | macOS (Darwin Kernel 24.6.0) |
-| Architecture | arm64 (Apple Silicon) |
 | CPU | Apple M2 Max |
 | Performance core frequency | Up to 3.33 GHz |
 | L1 Data Cache | 64 KB |
 | L2 Cache | 4 MB |
-| RAM | 32 GB |
 | Compiler | Apple clang 15.0.0 |
 | Optimization | `-O2 -fno-vectorize` |
-| Execution | Single-threaded, performance cores (no explicit affinity) |
+| Execution | Single-threaded, performance cores |
 
 ---
 
-## 1. Objective
+## 2. Hypotheses
 
-To empirically observe the difference between **latency-bound** and **throughput-bound** execution on a modern out-of-order superscalar CPU, and to build intuition for:
+### 2.1 Dependent Loop
 
-- Instruction-Level Parallelism (ILP)
-- Instruction latency vs. throughput
-- Execution port pressure
-- Loop-carried dependency chains
-- How compilers and hardware interact to reshape what actually executes
+A strict RAW chain — each iteration's output feeds the next. The CPU cannot overlap
+iterations because the next instruction cannot begin until the prior one completes.
+For `lsl` (left shift, 1-cycle latency on M2), the theoretical minimum is
+**1 cycle per iteration** — one new instruction issued per cycle, one retired per
+cycle, no parallelism possible beyond overlapping the countdown chain.
 
----
+### 2.2 Independent Loop (4 chains)
 
-## 2. Phase 1 — The Compiler Surprise
+Four chains with no shared inputs. The CPU can theoretically dispatch all four to
+separate integer ALU ports every cycle. In practice three friction points reduce the
+ideal 4× speedup:
 
-### 2.1 Initial Code
+1. **Port pressure:** four shifts competing for integer shift ports creates queuing.
+2. **Branch resolution:** `b.ne` at the end of each iteration serializes the start
+   of the next fetch — a structural bottleneck that both loops share equally.
+3. **ROB pressure:** four in-flight chains mean more instructions in the reorder
+   buffer simultaneously, increasing retirement backpressure.
 
-The first attempt used simple increment loops:
+Expected result: cycles per iteration **between 1.0 and 1.5**, with IPC significantly
+higher than the dependent case (more instructions execute per clock), but cycles per
+iteration also higher (more instructions to complete per loop).
 
-**Dependent version:**
-```cpp
-for (size_t i = 0; i < N; i++) {
-    x = x + 1;
-}
-```
+### 2.3 What Would Confirm ILP Is Happening
 
-**Independent version:**
-```cpp
-for (size_t i = 0; i < N; i++) {
-    a++; b++; c++; d++;
-}
-```
-
-### 2.2 Observed Result
-
-Both versions completed in **nanoseconds** regardless of `N`. This was unexpected — the independent version has 4× more arithmetic operations and should take meaningfully longer.
-
-### 2.3 Root Cause: Assembly Inspection
-
-Disassembly revealed the loop had been **completely eliminated**. The compiler recognized that both loops compute a deterministic closed-form result and replaced the entire loop with a single constant expression:
-
-```
-final_value = initial_value + N × constant
-```
-
-The CPU never executed a loop at runtime.
-
-### 2.4 Lesson Learned
-
-> **Microbenchmarks must always be validated by inspecting the generated assembly. Compilers aggressively eliminate loops whose results are statically predictable.**
-
-Modern compilers perform algebraic simplification, strength reduction, and loop-invariant code motion. Any benchmark that does not force the compiler to treat intermediate values as observable will silently measure nothing.
+- IPC of the independent loop should be meaningfully higher than the dependent loop.
+- llvm-mca should show the four `lsl` instructions dispatching with **identical** wait
+  times (parallel dispatch) rather than cumulative increasing times (serial execution).
+- Port contention should be higher in the independent loop — a sign the CPU is genuinely
+  attempting to use multiple ports.
 
 ---
 
-## 3. Phase 2 — The Hidden Confound
+## 3. Results — Measurement Journey
 
-### 3.1 Fix: Introducing Runtime Dependency
+Getting a clean ILP signal required three phases. The first two failed because the
+compiler either eliminated the loop entirely or introduced a hidden dependency through
+the loop counter. Each failure taught something important about the compiler-hardware
+interface.
 
-To prevent loop elimination, computation was tied to the loop variable at runtime:
+### 3.1 Phase 1 — Compiler Loop Elimination
+
+**Initial code:**
 
 ```cpp
-x += (i & 1);
+// Dependent
+for (size_t i = 0; i < N; i++) x = x + 1;
+
+// Independent
+for (size_t i = 0; i < N; i++) { a++; b++; c++; d++; }
 ```
 
-Since `i` changes every iteration and is not known at compile time, the compiler can no longer collapse the loop.
+**Result:** Both versions completed in nanoseconds regardless of N.
 
-### 3.2 Benchmark Code
+**Root cause:** The compiler recognised that both loops compute a deterministic
+closed-form result and replaced the entire loop body with a single constant expression —
+`final_value = initial_value + N × constant`. The CPU executed zero loop iterations
+at runtime. Assembly inspection confirmed the loop was absent from the binary.
 
-**Dependent version** — single dependency chain on `x`:
-```cpp
-for (size_t i = 0; i < N; i++) {
-    x += (i & 1);
-}
-```
+**Lesson:** Microbenchmarks must always be validated by inspecting the generated
+assembly. Compilers perform algebraic simplification and loop-invariant code motion
+aggressively. If the result is statically predictable, the loop will be eliminated.
 
-**Independent version** — four separate accumulator chains:
-```cpp
-for (size_t i = 0; i < N; i++) {
-    a += (i & 1);
-    b += (i & 1);
-    c += (i & 1);
-    d += (i & 1);
-}
-```
+### 3.2 Phase 2 — Hidden Loop Counter Dependency
 
-### 3.3 Results (N = 100,000,000)
+**Fix:** Tied computation to the loop variable at runtime: `x += (i & 1)`.
+
+Since `i` changes every iteration and is not a compile-time constant, the compiler
+cannot collapse the loop. The loops survive in the binary.
+
+**Results (N = 100,000,000):**
 
 | Version | Runtime (µs) | Ratio |
 |---|---|---|
 | Dependent | ~42,950 | 1.00× |
-| Independent | ~73,587 | 1.71× |
+| Independent (4 adds) | ~73,587 | 1.71× |
 
-The independent version is only **1.71× slower**, not the naively expected 4× slower. This suggests the CPU is overlapping some of the work in parallel — but 1.71× is also far from the ~0.25× (4× speedup) one might hope for from four truly independent chains.
+The 1.71× result was puzzling — expected either close to 1× (if the CPU fully
+parallelised the four chains) or 4× (if it executed them serially). 1.71× suggests
+partial parallelism but something is interfering.
 
-### 3.4 Assembly Analysis — Dependent Loop
-
-```asm
-LBB0_13:                          ; loop header
-    and  x10, x8, #0x1            ; compute (i & 1) → x10
-    add  x9,  x9,  x10            ; x += x10
-    add  x8,  x8,  #1             ; i++
-    cmp  x19, x8                  ; compare N, i
-    b.ne LBB0_13
-```
-
-**Dependency graph per iteration:**
-
-```
-x8(prev) ──→ and ──→ x10 ──→ add(x9)
-x8(prev) ──→ add(x8) ──→ cmp ──→ b.ne
-```
-
-Key observation: `x` (in `x9`) depends on `x10`, which depends on the loop counter `x8`. The loop counter is a **hidden dependency chain** feeding directly into the computation being measured. This benchmark does not purely isolate a latency-bound accumulator — it conflates accumulator latency with loop counter latency.
-
-### 3.5 Assembly Analysis — Independent Loop
+**Root cause — fan-out bottleneck:** Assembly inspection revealed that all four `add`
+instructions consumed the same `x10` register, produced by a single `and x10, x8, #1`
+instruction that itself depended on the loop counter `x8`:
 
 ```asm
-LBB0_13:                          ; loop header
-    and  x10, x8, #0x1            ; compute (i & 1) → x10
-    add  x9,  x9,  x10            ; a += x10
-    add  x21, x21, x10            ; b += x10
-    add  x23, x23, x10            ; c += x10
-    add  x22, x22, x10            ; d += x10
-    add  x8,  x8,  #1             ; i++
+LBB0_13:
+    and  x10, x8, #0x1    ; depends on loop counter x8
+    add  x9,  x9,  x10    ; a += x10
+    add  x21, x21, x10    ; b += x10  } all four read the same x10
+    add  x23, x23, x10    ; c += x10  }
+    add  x22, x22, x10    ; d += x10  }
+    add  x8,  x8,  #1     ; i++
     cmp  x19, x8
     b.ne LBB0_13
 ```
 
-The four `add` instructions are independent of each other and the CPU can dispatch them in parallel. However, **all four depend on `x10`**, which is the result of the single `and` instruction. This is a **fan-out bottleneck** — the four chains are not truly independent because they share a common upstream input computed once per iteration from the loop counter.
+The four chains share a common upstream `and` whose input is the loop counter. This is
+a **fan-out bottleneck** — the four adds are independent of each other but all gated
+on a single upstream result. Additionally, the loop counter update chain (`add x8 → cmp
+→ b.ne`) feeds into the computation, coupling the arithmetic latency to the loop control
+latency.
 
-This explains the 1.71× result: some parallelism is exploited, but the fan-out from `and` and the loop counter chain serialize each iteration.
+**llvm-mca confirmed:** the `cmp` showed 16.5 cycles of port contention from everything
+converging at that point, and the `and` result sat in the reorder buffer for 15 cycles
+while all four consumers read it.
 
-### 3.6 llvm-mca Confirmation — Dependent Loop
+**Lesson:** Tying computation to `i` introduces a hidden loop-counter dependency. The
+four chains were not truly independent. To isolate ILP cleanly, the workload must be
+**self-referential** — each chain depending only on its own previous output, with no
+connection to the loop counter.
 
-`llvm-mca` was used to simulate instruction-level scheduling on AArch64. The tool reports average cycles spent at each pipeline stage across simulated iterations.
+### 3.3 Phase 3 — Clean Isolation (Definitive Results)
 
-```
-      [0]    [1]    [2]    [3]   instruction
-0.     10    4.3    0.1    2.4   and  x10, x8, #0x1
-1.     10    7.5    0.0    0.0   add  x9, x9, x10
-2.     10    4.6    0.8    3.7   add  x8, x8, #1
-3.     10    7.1    1.7    0.0   cmp  x19, x8
-4.     10    9.0    0.0    0.0   b.ne LBB0_13
-       10    6.5    0.5    1.2   <total>
+**Design:** `x += x` — equivalent to `x = x << 1`. Each chain depends only on its
+own previous value. The loop counter has no connection to the arithmetic.
 
-[1] = avg cycles waiting in scheduler queue
-[2] = avg cycles waiting while ready (port contention)
-[3] = avg cycles in reorder buffer after writeback (retirement wait)
-```
-
-**Reading the data:**
-
-- `add x9` (the accumulator): waits 7.5 cycles, **zero port contention**. It is ready to execute the moment `x10` arrives but cannot start earlier — this is pure latency-bound behavior.
-- `add x8` (loop counter): 0.8 cycles of port contention — it occasionally competes with the accumulator add for the same integer ALU port.
-- `b.ne`: waits 9.0 cycles — last in the dependency chain, must wait for `cmp` which waits for `add x8` which waits for `and`.
-- **Total port contention: 0.5 cycles** — near zero. The bottleneck is entirely latency, not execution port availability.
-
-### 3.7 llvm-mca Confirmation — Independent Loop
-
-```
-      [0]    [1]    [2]    [3]   instruction
-0.     10    1.4    0.3   15.0   and  x10, x8, #0x1
-1.     10   16.2    2.6    0.0   add  x9,  x9,  x10
-2.     10   16.6    2.8    0.0   add  x21, x21, x10
-3.     10   17.2    2.8    0.0   add  x23, x23, x10
-4.     10   17.6    3.0    0.0   add  x22, x22, x10
-5.     10    1.1    0.8   17.5   add  x8,  x8,  #1
-6.     10   18.0   16.5    0.0   cmp  x19, x8
-7.     10   20.0    0.0    0.0   b.ne LBB0_13
-       10   13.5    3.6    4.1   <total>
-```
-
-**Reading the data:**
-
-- `and x10` executes quickly (1.4 cycles wait) but sits in the reorder buffer for **15 cycles** — its result is consumed by four downstream adds simultaneously, so the ROB must keep it live until all four have read it.
-- The four `add` instructions show identical wait times (~16–17 cycles) confirming **parallel dispatch** — if they were serial, wait times would be cumulative.
-- Port contention rises to **3.6 cycles** (vs 0.5 in the dependent case) — four instructions competing for ALU ports simultaneously creates measurable pressure.
-- Despite this, the dominant source of waiting (~14 cycles) is not port contention but the loop-carried dependency: each iteration's `and` must wait for the previous iteration's `add x8` to complete, which itself waited for the full chain ahead of it.
-- `cmp` shows 16.5 cycles of port contention — it is stuck behind both the four parallel adds and the loop counter update, all contending for ALU ports.
-
-**Summary:** Port contention increased (0.5 → 3.6 cycles), confirming the CPU is attempting parallel execution. But the loop-carried dependency through `x8` remains the dominant bottleneck, not port availability. The fan-out design did not achieve true independence.
-
----
-
-## 4. Phase 3 — Isolating the True Bottleneck
-
-### 4.1 Design: Removing the Loop Counter from the Computation
-
-To properly isolate latency-bound vs. throughput-bound behavior, the computation must not involve the loop counter `i` at all. The revised approach uses `x += x` (equivalent to left shift by 1), which forms a pure self-referential chain with no dependency on `i`:
-
-**Dependent version:**
-```cpp
-for (size_t i = 0; i < N; i++) {
-    x += x;
-}
-```
-
-**Independent version:**
-```cpp
-for (size_t i = 0; i < N; i++) {
-    a += a;
-    b += b;
-    c += c;
-    d += d;
-}
-```
-
-Assembly was inspected to confirm the compiler did not eliminate the loops.
-
-### 4.2 Dependent Loop Assembly
-
-```asm
-LBB0_15:
-    lsl  x8,  x8,  #1    ; x = x << 1  (i.e. x += x)
-    subs x19, x19, #1    ; N-- and set flags
-    b.ne LBB0_15
-```
-
-The compiler transformed `i++` / `i < N` into a **countdown from N to 0** using `subs`, which sets the zero flag directly and eliminates a separate `cmp` instruction. `lsl` and `subs` operate on completely different registers — they are **truly independent of each other** within each iteration. The only carried dependency is each instruction's output feeding its own next iteration.
-
-### 4.3 Dependent Loop — Results and IPC
+**Dependent loop:**
 
 ```
 N            = 100,000,000
 Runtime      = 34,622 µs
+Cycles       = 115,291,260
+Instructions = 300,000,000  (3 per iteration: lsl + subs + b.ne)
+IPC          = 2.60
+Cycles/iter  = 1.15
 ```
 
+**Independent loop (4 chains):**
+
 ```
-Cycles           = 0.034622 s × 3,330,000,000 Hz = 115,291,260
-Instructions     = 3 per iteration × 100,000,000 = 300,000,000
-IPC              = 300,000,000 / 115,291,260     = 2.60
-Cycles/iteration = 115,291,260 / 100,000,000     = 1.15
+N            = 100,000,000
+Runtime      = 42,212 µs
+Cycles       = 140,565,960
+Instructions = 600,000,000  (6 per iteration: 4×lsl + subs + b.ne)
+IPC          = 4.27
+Cycles/iter  = 1.41
 ```
 
-### 4.4 Dependent Loop — llvm-mca
+### 3.4 Hypothesis Validation
+
+| Prediction | Expected | Measured | Verdict |
+|---|---|---|---|
+| Dependent cycles/iter | ~1.0 cycle | 1.15 cycles | ✓ Near theoretical minimum |
+| Independent cycles/iter | 1.0–1.5 cycles | 1.41 cycles | ✓ Within predicted range |
+| IPC higher for independent | Yes | 4.27 vs 2.60 | ✓ Confirmed |
+| Port contention higher for independent | Yes | 0.7 vs 0.1 cycles | ✓ Confirmed |
+| Parallel dispatch (identical mca wait times) | Yes | Yes (5.5/6.5 for all 4 lsl) | ✓ Confirmed |
+
+---
+
+## 4. Assembly Analysis
+
+### 4.1 Dependent Loop
+
+```asm
+LBB0_15:
+    lsl  x8,  x8,  #1    ; x = x << 1  (x += x)
+    subs x19, x19, #1    ; N-- and set flags (countdown replaces cmp)
+    b.ne LBB0_15
+```
+
+Three instructions. The compiler transformed the ascending `i < N` loop into a
+**countdown from N to 0** using `subs`, which sets the zero flag directly and eliminates
+a separate `cmp`. `lsl` and `subs` operate on completely different registers — they are
+**genuinely independent within each iteration**. Two parallel dependency chains run
+simultaneously: the shift chain (`x8`) and the countdown chain (`x19`).
+
+**llvm-mca:**
 
 ```
       [0]    [1]    [2]    [3]   instruction
@@ -261,11 +222,16 @@ Cycles/iteration = 115,291,260 / 100,000,000     = 1.15
        10    3.8    0.1    0.0   <total>
 ```
 
-`lsl` and `subs` show **identical wait times (3.5 cycles)** and near-zero port contention (0.1 cycles each). This is the machine confirming they execute in parallel every iteration — they share no dependency and are dispatched to separate execution ports simultaneously. The 3.5 cycle wait reflects the depth of the out-of-order window across multiple overlapping iterations, not sequential stalling. Total port contention across the entire loop is **0.1 cycles** — essentially zero.
+`lsl` and `subs` show **identical scheduler wait times (3.5 cycles)** — the machine
+confirming they execute in parallel every iteration. Near-zero port contention (0.1 cycles).
+Total port contention: **0.1 cycles** — essentially zero. Throughput is limited by
+latency, not port availability.
 
-Cycles per iteration of **1.15** is close to the theoretical minimum of 1.0 for two parallel 1-cycle-latency chains. The small gap is explained by branch resolution overhead on a short loop and clock frequency variation under thermal management.
+Cycles per iteration of **1.15** is close to the theoretical minimum of 1.0 for two
+parallel 1-cycle-latency chains. The small gap comes from branch resolution overhead
+at loop entry and minor frequency variation under thermal management.
 
-### 4.5 Independent Loop Assembly
+### 4.2 Independent Loop
 
 ```asm
 LBB0_15:
@@ -277,23 +243,11 @@ LBB0_15:
     b.ne LBB0_15
 ```
 
-Six instructions per iteration. The four `lsl` operations all target different registers with no shared inputs — they are genuinely independent of each other.
+Six instructions per iteration. The four `lsl` operations target different registers
+with no shared inputs — **genuinely independent** of each other. Each forms its own
+loop-carried chain, and the four chains never interact.
 
-### 4.6 Independent Loop — Results and IPC
-
-```
-N            = 100,000,000
-Runtime      = 42,212 µs
-```
-
-```
-Cycles           = 0.042212 s × 3,330,000,000 Hz = 140,565,960
-Instructions     = 6 per iteration × 100,000,000 = 600,000,000
-IPC              = 600,000,000 / 140,565,960     = 4.27
-Cycles/iteration = 140,565,960 / 100,000,000     = 1.41
-```
-
-### 4.7 Independent Loop — llvm-mca
+**llvm-mca:**
 
 ```
       [0]    [1]    [2]    [3]   instruction
@@ -306,51 +260,128 @@ Cycles/iteration = 140,565,960 / 100,000,000     = 1.41
        10    4.5    0.7    1.8   <total>
 ```
 
-**Reading the data:**
-
-- All four `lsl` instructions show the **same wait times** (5.5 or 6.5 cycles) — confirming simultaneous parallel dispatch. Serial execution would show increasing wait times.
-- Port contention rises to **1.0–1.1 cycles** per `lsl` — four shift operations competing for execution ports creates real pressure, confirmed by measurement.
-- `subs` executes almost immediately (1.0 cycle wait) because its chain (`x19`) is independent of the four `lsl` chains. But it then sits in the ROB for **5.5 cycles** waiting to retire — it has finished executing but must wait for the four `lsl` instructions ahead of it in program order to complete (the CPU retires instructions in-order even when it executes out-of-order).
-- The 5.5 cycle ROB wait on `subs` and `b.ne` matches almost exactly the 5.5 cycle wait time of the `lsl` instructions — same pipeline depth seen from opposite perspectives.
-- **Total port contention: 0.7 cycles** — higher than the dependent case (0.1) but still not the dominant cost. The primary overhead is branch resolution serializing the start of each iteration.
-
----
-
-## 5. Cross-Experiment Summary
-
-| Experiment | Instructions/iter | Cycles/iter | IPC | Port contention | Bottleneck |
-|---|---|---|---|---|---|
-| Dependent `i&1` | 5 | ~1.43 | 3.5 | 0.5 cycles | Loop counter latency chain |
-| Independent `i&1` (4 adds) | 8 | ~1.71× slower | — | 3.6 cycles | Fan-out from `and`, loop counter |
-| Clean dependent (`x += x`) | 3 | 1.15 | 2.60 | 0.1 cycles | Near-peak, 2 parallel chains |
-| Clean independent (4× `a += a`) | 6 | 1.41 | 4.27 | 0.7 cycles | Branch resolution, port pressure |
-
-**Key insight:** The clean independent loop achieves **4.27 IPC** — significantly higher than the dependent loop's 2.60 — proving the M2 is genuinely dispatching multiple instructions in parallel across its execution ports. Yet its *cycles per iteration* is higher (1.41 vs 1.15) because adding more instructions also adds more pressure on the branch resolution and retirement pipeline. Higher IPC does not automatically mean faster execution — what matters is cycles per iteration, and that is constrained by the slowest serialization point in the loop.
+- All four `lsl` instructions show **identical wait times** (5.5 or 6.5 cycles) —
+  confirming simultaneous parallel dispatch. Serial execution would show increasing,
+  cumulative wait times.
+- Port contention rises to **1.0–1.1 cycles per lsl** — four shift operations competing
+  for the same integer shift ports creates measurable queuing pressure.
+- `subs` executes at only 1.0 cycle wait (its chain is independent of the four `lsl`
+  chains) but sits in the ROB for **5.5 cycles** — it has finished executing but cannot
+  retire because the CPU retires instructions **in program order** even when executing
+  out-of-order. It must wait for the four `lsl` instructions ahead of it.
+- The 5.5 cycle ROB wait on `subs` and `b.ne` matches the 5.5 cycle scheduler wait of
+  the `lsl` instructions — the same pipeline depth seen from opposite perspectives.
+- **Total port contention: 0.7 cycles** — higher than the dependent case (0.1) but
+  not the dominant cost. Branch resolution is still the primary serialisation point.
 
 ---
 
-## 6. Concepts Demonstrated
+## 5. Interpretation
 
-**Latency** is the time for one instruction's result to become available to the next. A dependent chain is bounded by accumulated latency: `time ≈ N × latency_per_op`.
+### 5.1 IPC vs Cycles per Iteration — Two Different Questions
 
-**Throughput** is the rate at which a CPU can sustain execution of a given instruction type across its execution ports. Independent instructions are bounded by throughput: `time ≈ N × instructions / port_width`.
+| Loop | Instr/iter | Cycles/iter | IPC | Port contention |
+|---|---|---|---|---|
+| Dependent (`x += x`) | 3 | 1.15 | 2.60 | 0.1 cycles |
+| Independent (4× `a += a`) | 6 | 1.41 | 4.27 | 0.7 cycles |
 
-**Out-of-order execution** allows the CPU to look ahead in the instruction stream and execute independent instructions before prior instructions have retired — this is why multiple iterations can be in-flight simultaneously, and why `subs` can execute while `lsl` instructions are still running.
+The independent loop achieves **4.27 IPC** vs the dependent loop's **2.60 IPC** —
+the M2 is genuinely dispatching more instructions per clock when they are independent.
+Yet the independent loop's cycles per iteration is **higher** (1.41 vs 1.15).
 
-**Loop-carried dependencies** are the dominant bottleneck in tight loops. Even when individual instructions are fast, a dependency that crosses iteration boundaries serializes execution at the granularity of that dependency's latency.
+This is not a contradiction. There are twice as many instructions to complete per
+iteration (6 vs 3). IPC measures how efficiently the CPU is being utilised; cycles
+per iteration measures how fast the loop actually runs. For performance, cycles per
+iteration is what matters. Adding ILP-exploitable work makes the CPU work harder
+but does not always make it finish sooner, because every iteration still ends with
+a branch that partially serialises the start of the next.
 
-**Port contention** is real but secondary in these experiments. The M2's wide execution backend (estimated 6+ integer ALU ports) absorbs 4 simultaneous shift operations with only ~1 cycle of average contention — the architecture is genuinely wide.
+### 5.2 Why the Dependent Loop Is Faster Per Iteration
 
-**Compiler interaction** is non-negotiable knowledge for anyone doing performance work. The compiler transformed `i < N` counting-up into a `subs`-based countdown, merged a `cmp` into the subtract, and replaced `x += x` with `lsl`. The assembly is what executes — source code is a description of intent, not of execution.
+The dependent loop has only 3 instructions and two genuinely parallel chains (`lsl`
+and `subs`). With 1-cycle latency per instruction and complete overlap, the theoretical
+minimum is 1.0 cycle/iteration. The measured 1.15 is near-optimal.
+
+The independent loop adds four arithmetic chains but does not remove the branch
+resolution bottleneck. Port pressure increases to 0.7 cycles. The ROB holds more
+in-flight work. These factors push cycles/iteration from 1.15 to 1.41 despite the
+higher IPC — the marginal work added by extra chains costs more than it saves because
+the iteration boundary bottleneck remains fixed.
+
+### 5.3 What the M2's Architecture Reveals
+
+**The M2 is a genuinely wide machine.** Four simultaneous shift operations produce
+only ~1 cycle of average port contention per instruction — the execution backend absorbs
+them without significant queuing. The out-of-order window is deep enough to find and
+dispatch parallel work across multiple iterations simultaneously, which is why
+instructions appear to wait 3.5–6.5 cycles in the scheduler rather than executing
+immediately: they are not stalled, they are being held while other in-flight iterations
+overlap around them.
+
+**In-order retirement is the hidden structural cost.** `subs` executes at 1.0 cycle
+wait but waits 5.5 cycles in the ROB. The CPU is fast at executing — it is constrained
+by the requirement to retire in program order. Adding more instructions to a loop means
+more time in the ROB queue, which sets a floor on the minimum cycles per iteration
+regardless of how many execution ports are available.
+
+**Loop-carried dependencies are the true bottleneck.** Even in the independent loop,
+the loop counter chain (`subs → b.ne`) forms its own loop-carried dependency that
+serialises iteration starts. The theoretical ILP ceiling from four independent chains
+is never fully achieved because this structural chain always exists.
+
+### 5.4 Three Compiler Transformations That Matter
+
+1. **Loop elimination (Phase 1):** A deterministic sum was replaced with a single
+   constant addition. The binary contained no loop at all.
+2. **Countdown transformation:** `i < N` ascending iteration became a `subs`-based
+   countdown, merging decrement and flag-set into one instruction and eliminating `cmp`.
+3. **Strength reduction:** `x += x` was compiled to `lsl x, x, #1` — multiply-by-2
+   expressed as a zero-cost shift.
+
+All three are correct compiler behaviour. The benchmarker's job is to know about them
+and design experiments that survive them. Assembly inspection is the verification step
+that confirms the workload is what you think it is.
 
 ---
 
-## 7. Tooling Notes
+## 6. Key Takeaways
 
-**Assembly inspection:** `objdump -d` or Compiler Explorer (`godbolt.org`) with `--target=aarch64`.
+**ILP is real and measurable on Apple M2.** The independent loop achieves 4.27 IPC
+vs 2.60 for the dependent loop, directly demonstrating that the M2 dispatches multiple
+instructions to separate execution units every cycle. The hardware is wide — four
+simultaneous 1-cycle-latency instructions encounter only ~1 cycle of average port
+contention.
 
-**llvm-mca:** Static pipeline simulation tool. Run against just the hot loop body for accurate results. Apple's clang does not ship `llvm-mca` — install via `brew install llvm` and invoke as `/opt/homebrew/opt/llvm/bin/llvm-mca`. Use Apple's clang (`/usr/bin/clang++`) for compilation to avoid libc++ compatibility issues with Homebrew LLVM 21.
+**IPC and cycles per iteration measure different things — use cycles per iteration.**
+The independent loop has higher IPC (more CPU utilisation) yet more cycles per
+iteration (slower wall-clock progress). In tight loops with fixed branch overhead, the
+benefit of ILP is partial, not linear. Cycles per iteration is the correct metric for
+comparing loop performance; IPC characterises how efficiently the hardware is being
+used, not how fast the work completes.
 
-**Hardware PMU counters:** `xctrace` (Instruments) is the native macOS profiler but requires entitlements that are frequently killed in terminal sessions on M2. For cycle-level PMU access, Instruments.app is more reliable than the CLI. Apple Silicon does not expose per-execution-port counters publicly — `llvm-mca` simulation is the closest available substitute for port-level visibility.
+**Loop-carried dependencies are the dominant bottleneck in tight arithmetic loops.**
+Even with four genuinely independent chains, branch resolution at the end of each
+iteration serialises the start of the next. The theoretical maximum speedup from
+independent arithmetic is never fully achieved because the loop control structure
+itself forms a dependency chain that no amount of arithmetic ILP can eliminate.
 
-**Timing:** `std::chrono::steady_clock` with microsecond resolution. Sufficient for N=100M workloads. For smaller N, switch to nanosecond resolution and run multiple trials to establish min/avg/max.
+**A hidden dependency can silently corrupt an experiment.** The `i & 1` design
+funnelled all four chains through a single `and` result that depended on the loop
+counter. What appeared to be four independent chains was actually one chain with a
+fan-out. The llvm-mca data revealed the structural error — the fan-out sat in the
+ROB for 15 cycles and `cmp` accumulated 16.5 cycles of port contention, both
+clear diagnostic signatures of a convergence bottleneck.
+
+**Assembly inspection is mandatory, not optional.** The compiler eliminated the loop
+entirely in Phase 1 and introduced a hidden dependency in Phase 2. Both produced
+plausible-looking timing numbers. Only reading the generated assembly revealed that
+neither was measuring what was intended. Source code describes intent; assembly is
+what executes.
+
+**`llvm-mca` is the best available tool for port-level visibility on Apple Silicon.**
+Apple's hardware PMU does not expose per-execution-port counters. `llvm-mca` static
+simulation provides scheduler wait times, port contention, and ROB occupancy data
+that make dependency chain analysis possible. Install via `brew install llvm` and
+invoke as `/opt/homebrew/opt/llvm/bin/llvm-mca`. Use Apple's own clang
+(`/usr/bin/clang++`) for compilation to avoid libc++ compatibility issues with
+Homebrew LLVM.

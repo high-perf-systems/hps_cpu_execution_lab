@@ -2,51 +2,70 @@
 
 ## 1. Experimental Design
 
-This experiment isolates the cost of **branch misprediction** — specifically the pipeline
-flush penalty — with memory effects explicitly excluded. Both branches perform identical
-arithmetic work and the condition array is accessed sequentially in all cases. The hardware
-prefetcher sees the same access pattern regardless of branch outcome. Memory is not a
-variable here.
+This experiment isolates the cost of **branch misprediction** — specifically the
+pipeline flush and re-fetch penalty — with memory effects explicitly excluded. Both
+benchmark variants perform identical arithmetic on the same data values. The condition
+array is accessed sequentially in all cases, so the hardware prefetcher sees the same
+access pattern regardless of branch outcome. Memory is not a variable.
 
-The only variable between cases is the **predictability of the branch outcome**.
+The only variable between the two cases is the **predictability of the branch outcome**:
 
 | Case | Condition Array | Expected Misprediction Rate |
 |---|---|---|
-| Predictable | Sorted ascending | Near zero (long predictable runs) |
-| Unpredictable | Random values 0–255 | ~50% |
+| Predictable | Sorted ascending (0, 0, ..., 127, 128, ..., 255) | Near zero — long identical runs |
+| Unpredictable | Random values 0–255 | ~50% — no learnable pattern |
+
+**Why predictability matters at the hardware level:** Modern branch predictors maintain
+a history of recent branch outcomes and use them to speculatively fetch and execute
+instructions before the branch condition is known. When the prediction is correct,
+speculation is free — the work was going to be done anyway. When the prediction is
+wrong, the entire speculatively executed instruction window must be discarded, the
+pipeline flushed, and execution restarted from the correct path. On a deep
+out-of-order pipeline like the M2, this flush discards many in-flight instructions
+and costs a significant number of cycles.
 
 **Execution environment:** Apple M2 Max, Apple clang 15.0.0, `-O2 -fno-vectorize`,
-single-threaded, working set fits in L1 cache.
+single-threaded, working set fits entirely in L1 cache (N = 100M bytes = 100 MB raw
+data, but the accessed slice stays hot after warmup).
 
 ---
 
 ## 2. Hypotheses
 
 **H1 — Relative performance:** The predictable case will be significantly faster.
-The M2 branch predictor recognizes patterns in branch history. A sorted array produces
-long runs of the same branch outcome — the predictor locks onto each run with near-zero
-misprediction rate. The random case forces ~50% mispredictions, each costing an estimated
-10–16 cycle pipeline flush. Expected slowdown: **2–4×**.
+The M2 predictor recognises patterns in branch outcome history. A sorted array produces
+long runs of the same outcome — not-taken for the lower half, taken for the upper half
+— with a single transition point. The predictor locks onto each run within a few
+iterations and maintains near-zero misprediction rate for the rest. The random case
+produces a ~50% misprediction rate with no learnable pattern — every iteration is
+effectively a coin flip for the predictor.
 
-**H2 — Sorted data:** The predictor handles sorted data well. The mechanism is pattern
-recognition in branch outcome history. Long runs of identical outcomes are among the
-easiest patterns for a predictor to learn.
+Expected slowdown for the random case: **2–4×**.
 
-**H3 — Theoretical penalty:** At 50% misprediction rate, N = 100,000,000, 15-cycle penalty:
+**H2 — Misprediction penalty estimate:**
+
+At 50% misprediction rate with an estimated 15-cycle penalty per misprediction:
+
 ```
-Additional cycles = 15 × 0.50 × 100,000,000 = 750,000,000
-Additional time   = 750,000,000 / 3,330,000,000 Hz ≈ 225 ms
+Additional cycles = 15 × 0.50 × 100,000,000 iterations = 750,000,000 cycles
+Additional time   = 750,000,000 / 3,330,000,000 Hz      ≈ 225 ms
 ```
+
+**H3 — Correctness invariant:** Both cases must produce the **identical sum**. The
+data values are the same — only their order differs. A sum mismatch would indicate
+the benchmark is computing different things, invalidating the comparison.
 
 ---
 
-## 3. Benchmark Design Journey — Compiler Obstacles
+## 3. Results — Benchmark Design Journey
 
-Getting a benchmark that actually measures branch prediction required three iterations.
-The compiler aggressively eliminated branches in each attempt before a valid design
-was found. This section documents why each attempt failed and what was learned.
+Getting a benchmark that actually measures branch prediction required three successive
+design attempts. The compiler eliminated the branch in all initial attempts using
+**if-conversion** — replacing conditional branches with branchless conditional select
+instructions. This is correct compiler behaviour, but it means the branch predictor
+is never involved and no misprediction cost is ever paid.
 
-### 3.1 First Attempt — Boolean Array with Simple Arithmetic
+### 3.1 Attempt 1 — Boolean Array with Simple Arithmetic
 
 ```cpp
 std::vector<uint8_t> data(N);
@@ -59,147 +78,153 @@ for (size_t i = 0; i < N; i++) {
 ```
 
 **Assembly produced:**
+
 ```asm
 LBB0_5:
     ldrb  w11, [x10, x8]     ; load data[i]
-    sub   x12, x9, #1        ; precompute sum - 1  (else result)
-    cmp   w11, #0             ; test condition
-    csinc x9, x12, x9, eq    ; select: sum-1 if false, sum+1 if true — NO BRANCH
+    sub   x12, x9, #1        ; precompute sum - 1  (else branch result)
+    cmp   w11, #0
+    csinc x9, x12, x9, eq   ; if false: x9 = x12 (sum-1), if true: x9 = x9+1
     add   x8, x8, #1
     b.ne  LBB0_5
 ```
 
-**Why it failed:** The compiler applied **if-conversion** — replacing the branch with
-`csinc` (Conditional Select Increment). It precomputed both outcomes simultaneously
-(`sum-1` stored in `x12`, `sum+1` via the `csinc` increment) and selected between them
-in a single instruction. No branch exists, so the predictor is never involved.
+**Why it failed:** The compiler applied **if-conversion** — replacing the conditional
+branch with `csinc` (Conditional Select Increment). It precomputed both outcomes
+(`sum-1` in `x12`, `sum+1` via the implicit increment) and selected between them
+with one instruction. No branch exists. The branch predictor is never invoked.
 
 `csinc Xd, Xn, Xm, cond` semantics:
-- If condition true:  `Xd = Xn`
-- If condition false: `Xd = Xm + 1`
+- Condition true:  `Xd = Xn`
+- Condition false: `Xd = Xm + 1`
 
-The compiler applies if-conversion whenever both branch paths are pure arithmetic on
-registers with no side effects — both outcomes are cheap to precompute, and a
-conditional select instruction can express the selection in one instruction.
-Branchless execution avoids any misprediction cost, which is correct compiler behavior
-for the general case.
+The compiler applies if-conversion whenever both branch paths consist of pure
+arithmetic on registers with no side effects, and both outcomes are cheap enough to
+precompute. Branchless execution avoids any misprediction cost — which is genuinely
+correct behaviour for the general case.
 
-### 3.2 Further Attempts — All Defeated by the Compiler
+### 3.2 Attempts 2 and 3 — All Defeated by If-Conversion
 
 **Complex arithmetic bodies** (`sum += sum * 3 + 1` vs `sum += sum * 7 + 3`): The
-compiler used ARM shifted register operands (`lsl #1`) to precompute both sides as
-shift-and-add sequences, then selected with `csinc`. Multiply-by-small-constants is
-free on ARM, so the bodies remained cheap enough for if-conversion.
+compiler used ARM shifted register operands to precompute both sides as shift-and-add
+sequences, then selected with `csinc`. Small-constant multiplication is free on ARM
+(expressed as shift + add), keeping both outcomes cheap enough for if-conversion.
 
-**Memory writes inside branches**: Writing results to an output array. The compiler
-proved the array was only observed after the loop and eliminated stores as dead code,
-reducing back to register arithmetic and `csinc`.
+**Memory writes inside branches** (writing results to an output array): The compiler
+proved the array was only observed after the loop and eliminated the stores as dead
+code, reducing back to register arithmetic and `csinc`.
 
-**`__builtin_expect`**: Ignored by Apple clang for if-conversion purposes.
+**`__builtin_expect`**: Ignored by Apple clang for if-conversion decisions.
 
 **`-fno-if-conversion`**: Not supported by Apple clang.
 
-### 3.3 Final Design — Sorted vs Unsorted Threshold Comparison
+### 3.3 Final Design — Threshold Comparison on Random Data
 
 ```cpp
 std::vector<uint8_t> data(N);
 for (size_t i = 0; i < N; i++) data[i] = rand() % 256;
 
-std::sort(data.begin(), data.end());   // predictable.cpp only
+std::sort(data.begin(), data.end());   // predictable variant only
 
 for (size_t i = 0; i < N; i++) {
     if (data[i] >= 128) sum += data[i];
 }
 ```
 
-This forces a real branch for three reasons. The condition `data[i] >= 128` on random
-data is genuinely unpredictable at compile time — the compiler cannot prove the
-distribution. The body `sum += data[i]` creates a data dependency on the loaded value,
-making both-path precomputation expensive. The compiler cannot prove the branch is
-biased enough to justify if-conversion.
+This forces a genuine branch for three reasons. The condition `data[i] >= 128` on
+random data has an unknown distribution at compile time — the compiler cannot prove
+it is biased in either direction. The body `sum += data[i]` creates a data dependency
+on the loaded value, making precomputation of the taken-path outcome expensive (the
+value is not known until the load resolves). The compiler cannot justify if-conversion
+because one path has meaningful work and the other has none — asymmetric paths resist
+precomputation.
 
-This is also the pattern behind the famous Stack Overflow branch prediction demonstration
-that showed sorting data before processing it can produce a 6× speedup.
+This is also the pattern behind the widely known Stack Overflow branch prediction
+demonstration: sorting data before processing can produce a 6× speedup because it
+converts an unpredictable branch into a predictable one.
 
----
-
-## 4. Results (N = 100,000,000)
+### 3.4 Final Results (N = 100,000,000)
 
 | Case | Runtime (µs) | Ratio |
 |---|---|---|
 | Predictable (sorted) | 36,629 | 1× (baseline) |
 | Unpredictable (random) | 307,929 | 8.4× slower |
 
-**Sum is identical in both cases: 9,574,441,916** — confirming both runs execute the
-same algorithm over the same data values, differing only in order.
+**Both cases produce the identical sum: 9,574,441,916** — confirming both runs
+execute the same computation on the same values, differing only in access order.
 
-**Measured misprediction penalty:**
-```
-307,929 - 36,629 = 271,300 µs ≈ 271 ms additional time
-```
+**Measured misprediction overhead:**
 
-**Hypothesis 3 validation:**
 ```
-Predicted : ~225 ms
-Measured  :  271 ms
+307,929 − 36,629 = 271,300 µs ≈ 271 ms additional time
 ```
 
-Order of magnitude correct. The gap is because the baseline iteration cost is not
-negligible — 36ms of real load and accumulation work adds to the total penalty.
+**Hypothesis H2 validation:**
 
-**The 8.4× speedup significantly exceeded the 2–4× hypothesis.** See interpretation.
+```
+Predicted additional time : ~225 ms
+Measured additional time  :  271 ms
+```
+
+Directionally correct. The 20% gap arises because the baseline 36ms of load and
+accumulate work is non-negligible — the misprediction penalty compounds on top of
+a non-zero baseline, not on top of zero.
+
+**The 8.4× slowdown significantly exceeded the 2–4× prediction.** See section 5 for
+the full explanation.
 
 ---
 
-## 5. Assembly Analysis
+## 4. Assembly Analysis
 
-Both `predictable.cpp` and `unpredictable.cpp` produce identical assembly — the code
-is the same, only the data differs. The hot loop:
+Both `predictable.cpp` and `unpredictable.cpp` compile to **identical assembly** — the
+source code is the same, only the runtime data order differs. The hot loop:
 
 ```asm
 LBB0_35:                          ; =>This Inner Loop Header: Depth=1
-    ldrsb  w9, [x8]               ; load data[i] as signed byte into w9
-    tbz    w9, #31, LBB0_34       ; test bit 31 — if 0 (data[i]<128): skip to LBB0_34
+    ldrsb  w9, [x8]               ; sign-extend load data[i] into w9
+    tbz    w9, #31, LBB0_34       ; if bit 31 == 0 (data[i] < 128): skip to LBB0_34
 
 ; %bb.36: fall-through — data[i] >= 128
     and    x9, x9, #0xff          ; mask sign extension → recover true uint8 value
-    ldr    x10, [sp, #24]         ; load sum from stack into x10
+    ldr    x10, [sp, #24]         ; load sum from stack
     add    x9, x10, x9            ; sum += data[i]
     str    x9, [sp, #24]          ; store sum back to stack
-    b      LBB0_34                ; rejoin loop increment
+    b      LBB0_34               ; rejoin loop
 
 LBB0_34:                          ; loop increment
     add    x8, x8, #1             ; advance data pointer
     subs   x20, x20, #1           ; N-- and set flags
-    b.eq   LBB0_20                ; exit if N == 0, else fall through to LBB0_35
+    b.eq   LBB0_20                ; exit if N == 0
 ```
 
-**`tbz` — a real branch.** `tbz` (Test Bit and Branch if Zero) is a genuine conditional
-branch instruction — not `csinc`. The predictor must evaluate it every iteration.
+**`tbz` is a genuine branch.** `tbz` (Test Bit and Branch if Zero) is a real conditional
+branch instruction — not a `csinc`. The branch predictor must evaluate it on every
+iteration. This is the key instruction that makes the benchmark work.
 
 **How `tbz` implements `data[i] >= 128`:** `ldrsb` sign-extends the loaded byte to
-32 bits. Values 0–127 have bit 31 = 0 after sign extension. Values 128–255 have
-bit 31 = 1. Testing bit 31 is therefore equivalent to the `>= 128` threshold — an
-elegant single-instruction implementation derived automatically by the compiler.
+32 bits. Values 0–127 have bit 31 = 0 after sign extension. Values 128–255 (which
+sign-extend to negative 32-bit values) have bit 31 = 1. Testing bit 31 is therefore
+equivalent to the `>= 128` threshold — a single-instruction implementation derived
+automatically by the compiler.
 
-**Two execution paths per iteration:**
+**Two execution paths with different costs per iteration:**
 
 ```
-data[i] < 128:   ldrsb → tbz (branch taken) → LBB0_34
-                 3 instructions, no memory write
+data[i] < 128  :  ldrsb → tbz (branch taken) → LBB0_34
+                  3 instructions, no memory write, ~3 cycles
 
-data[i] >= 128:  ldrsb → tbz (fall through) → and → ldr → add → str → LBB0_34
-                 7 instructions, stack load + store for sum
+data[i] >= 128 :  ldrsb → tbz (fall-through) → and → ldr → add → str → LBB0_34
+                  7 instructions, stack load + store, dependency chain extends
 ```
 
-**Sum is spilled to the stack.** Rather than keeping `sum` in a register, the compiler
-stores it at `[sp, #24]` and reloads it each taken iteration. This adds a load-store
-round trip to the critical path of every `sum += data[i]` execution, extending the
-dependency chain length and amplifying the misprediction penalty.
+**Sum is spilled to the stack.** Rather than keeping `sum` in a register throughout,
+the compiler stores it at `[sp, #24]` and reloads it on the taken path. This adds a
+load-store round trip to the dependency chain of every `sum += data[i]` execution.
+The spill extends the critical path and amplifies the cost of each misprediction,
+since more instructions must be re-executed from the correct starting point.
 
----
-
-## 6. llvm-mca Analysis
+**llvm-mca analysis of the loop body:**
 
 ```
       [0]    [1]    [2]    [3]   instruction
@@ -216,129 +241,160 @@ dependency chain length and amplifying the misprediction penalty.
        10    5.7    1.1   80.7   <total>
 ```
 
-**Column [3] — ROB occupancy ~85 cycles across all instructions.**
+**Column [3] — ROB occupancy ~80–89 cycles across all instructions.** Every
+instruction executes quickly but waits ~85 cycles in the reorder buffer before
+retiring. This is the signature of deep speculative execution — the out-of-order
+window holds many iterations simultaneously. Instructions complete early but cannot
+retire until all prior instructions in program order commit.
 
-Every instruction executes quickly but waits ~85 cycles in the reorder buffer before
-retiring. This is the signature of deep speculative execution — the out-of-order window
-holds many iterations simultaneously. Instructions complete but cannot retire until all
-prior instructions in program order commit. The CPU is productive; retirement is the
-bottleneck, not execution.
+**`tbz` waits 8.6 cycles (column [1]), zero port contention (column [2]).** It is
+waiting purely for `w9` from `ldrsb`. L1 load latency on M2 is ~4 cycles. The 8.6
+cycle average reflects multiple overlapping iterations in the out-of-order window,
+each waiting on their respective loads.
 
-**`tbz` waits 8.6 cycles, zero port contention.**
-
-Waiting entirely for `w9` from `ldrsb`. L1 load latency on M2 is ~4 cycles. The 8.6
-cycle average reflects multiple overlapping iterations in the out-of-order window, each
-waiting on their respective loads.
-
-**The taken path dependency chain:**
+**The taken-path dependency chain:**
 
 ```
-ldrsb w9            (memory load — ~4 cycle latency)
+ldrsb w9             (memory load — ~4 cycles)
     ↓
-tbz  w9, #31        (waits for w9)
+tbz  w9, #31         (waits for w9)
     ↓
-and  x9, x9, #0xff  (waits for w9)
+and  x9, x9, #0xff   (waits for w9)
     ↓
-add  x9, x10, x9    (waits for x9 from and AND x10 from ldr — join point)
+add  x9, x10, x9     (join point — waits for both `and` result AND `ldr` result)
     ↓
-str  x9, [sp, #24]  (waits for x9 from add)
+str  x9, [sp, #24]   (waits for add)
 ```
 
-Five serial instructions. The `add` at instruction 7 is a join point — it must wait
-for both the `and` result (x9) and the stack load result (x10). It cannot execute until
-the slower of the two arrives.
+Five serial instructions on the critical path. The `add` is a join point — it must
+wait for both the `and` (from the loaded data value) and `ldr x10` (the stack sum
+load). It cannot execute until the slower of the two arrives.
 
-**`ldr x10, [sp, #24]` — 100% port contention (1.1 cycles).**
-
-The sum stack load has no data dependency so it is ready immediately — but competes
-with `ldrsb` for the same load execution port. This is the only significant port
-contention in the loop.
-
-**Total port contention: 1.1 cycles.** The loop is latency-bound on the load-to-use
-chain, not port-bound.
+**`ldr x10, [sp, #24]` — 100% port contention (1.1 cycles).** The sum stack load
+has no data dependency so it is ready to execute immediately — but it competes with
+`ldrsb` for the same load execution port. This is the only significant port contention
+in the loop; everything else is latency-bound on the load-to-use chain.
 
 ---
 
-## 7. Interpretation
+## 5. Interpretation
 
-### 7.1 Why Predictable Is 8.4× Faster
+### 5.1 Why Predictable Is 8.4× Faster
 
-The sorted array produces two long runs of identical branch outcomes:
-
-```
-Iterations 0 – ~50M:  data[i] < 128  → branch not taken, every iteration
-[transition: ~1-2 mispredictions]
-Iterations ~50M – N:  data[i] >= 128 → branch taken, every iteration
-```
-
-The predictor quickly learns each run and predicts correctly for ~50M consecutive
-iterations. Total mispredictions: approximately 1–2 at the single transition point.
-The pipeline stays full and productive for essentially the entire run.
-
-The random array produces no learnable pattern. The predictor is wrong ~50% of the
-time — 50 million mispredictions, each flushing the pipeline and wasting ~15 cycles
-of speculative work that must be discarded and redone.
-
-### 7.2 Why the Speedup Was 8.4× Not 2–4×
-
-The hypothesis underestimated the penalty for two reasons.
-
-Each misprediction flushes an entire window of speculative work — not just one
-instruction but potentially 10–20 instructions already in-flight across multiple
-iterations. The deep out-of-order window of the M2 means more work is in-flight
-and more is wasted per flush.
-
-The taken path has a 5-instruction serial dependency chain ending in a stack store.
-After a misprediction, this entire chain must be re-executed from the correct starting
-point. The combination of pipeline refill cost and re-execution of the serial chain
-produces a larger penalty than the simple `mispredictions × penalty_cycles` model.
-
-### 7.3 Branchless vs Branchy — When Each Wins
-
-The compiler's `csinc` optimization in the first benchmark attempts was not a bug — it
-was correct behavior. For a branch with a simple symmetric body and unpredictable
-outcomes, branchless code is genuinely faster because it eliminates misprediction cost
-entirely by always computing both outcomes.
-
-The crossover point:
+The sorted array creates exactly two long runs of identical branch outcomes:
 
 ```
-Branchless wins: unpredictable branch + cheap symmetric body
-Branchy wins:    predictable branch (any body) OR expensive asymmetric body
+Iterations 0 to ~50M:   data[i] < 128  → tbz taken, every iteration
+[transition: ~1–2 mispredictions at the crossover point]
+Iterations ~50M to N:   data[i] >= 128 → tbz not taken, every iteration
 ```
 
-This is a real design decision in performance-critical code. Database engines, parsers,
-and network packet processors are explicitly designed around this tradeoff.
+The M2 branch predictor learns each run within a few iterations and maintains
+correct predictions for ~50M consecutive iterations. Total mispredictions across
+the entire run: approximately 1–2 at the single transition point. The pipeline
+stays fully speculative and productive for essentially the whole run.
 
-### 7.4 The Stack Spill Amplifies the Penalty
+The random array produces no learnable pattern — the taken/not-taken sequence is
+approximately uniformly random. The predictor is wrong ~50% of the time: 50 million
+mispredictions, each flushing the pipeline, discarding in-flight speculative work,
+and restarting from the correct path.
 
-Sum being spilled to the stack rather than kept in a register adds a load-store round
-trip to every taken iteration. In the predictable case this is a fixed overhead the
-pipeline handles efficiently. In the unpredictable case, each misprediction forces
-re-execution of the longer spill-inclusive dependency chain, amplifying the per-
-misprediction cost beyond what a register-resident `sum` would incur.
+### 5.2 Why the Speedup Was 8.4× Not 2–4×
+
+The hypothesis underestimated the penalty for two compounding reasons.
+
+**The M2's deep out-of-order window amplifies flush cost.** When a misprediction is
+detected, all instructions after the mispredicted branch that are already in-flight
+must be squashed. On a deep out-of-order machine, this can be 100+ in-flight
+micro-operations across many speculative iterations. The M2's ROB occupancy data
+shows ~85 cycles of in-flight work per instruction — the flush discards a much larger
+window than the simple `mispredictions × 15-cycle penalty` model assumes.
+
+**The taken-path dependency chain extends re-execution cost.** After each flush, the
+pipeline must re-fetch from the correct path and re-execute the 5-instruction serial
+chain (`ldrsb → tbz → and → add → str`), including the stack load. The stack spill
+in particular extends the chain — a register-resident sum would have a shorter
+dependency chain to re-execute, producing a smaller per-misprediction penalty.
+
+The combination of flush cost (discarding a deep speculative window) and re-execution
+cost (a 5-instruction serial chain with a memory spill) produced a much larger total
+penalty than the simplified model predicted.
+
+### 5.3 Branchless vs Branchy — When Each Is Correct
+
+The compiler's if-conversion in the first three attempts was not a bug — it was the
+right optimisation for those loop shapes. For a branch with a cheap symmetric body
+and an unpredictable condition, `csinc` is genuinely faster: both outcomes are
+computed unconditionally, the misprediction cost is zero, and the total cost is
+predictable and constant per iteration.
+
+The crossover:
+
+```
+Branchless is faster:  unpredictable condition + cheap, symmetric body
+Branchy is faster:     predictable condition (any body)
+                       OR asymmetric body (one path much cheaper than the other)
+```
+
+For the threshold benchmark with `sum += data[i]` only on the taken path, the two
+paths are asymmetric — the taken path does real work and the not-taken path does
+nothing. Branchless code would have to compute `sum += data[i]` unconditionally and
+then conditionally discard it, which has different performance characteristics.
+The real branch lets the not-taken path skip all that work at the cost of prediction
+fidelity.
+
+This is a real engineering decision in database engines, parsers, and network packet
+processors — fields where branch predictability and body symmetry are explicitly
+considered in the inner-loop design.
+
+### 5.4 The Stack Spill Is an Amplification Factor
+
+Sum spilled to `[sp, #24]` rather than kept in a register adds one load and one store
+to the taken-path critical chain every iteration. In the predictable case this overhead
+is constant and the pipeline handles it without disruption. In the unpredictable case,
+each misprediction requires re-executing the full spill-inclusive chain, making every
+misprediction more expensive than it would be with a register-resident accumulator.
+The register allocator's decision to spill directly multiplies the branch misprediction
+penalty.
 
 ---
 
-## 8. Key Takeaways
+## 6. Key Takeaways
 
-**Branch misprediction is expensive.** A single misprediction on M2 costs 10–16 cycles
-of pipeline flush plus re-execution. At ~50M mispredictions over 100M iterations, this
-produced 271ms of overhead and an 8.4× slowdown.
+**Branch misprediction is the most expensive single event in a tight loop on M2.**
+At ~50M mispredictions over 100M iterations, the overhead was 271ms and the slowdown
+was 8.4× — far beyond the naive estimate. A single misprediction discards a deep
+speculative window plus requires re-executing a serial dependency chain. The total
+cost per misprediction on M2 is substantially higher than the commonly cited
+"10–15 cycle penalty."
 
-**The predictor learns patterns in branch outcome history, not data values.** Sorted
-data produces long predictable runs. Random data produces unpredictable outcomes. The
-data values themselves are irrelevant — only the sequence of taken/not-taken matters.
+**The predictor learns branch outcome history, not data values.** Sorted data is fast
+because it produces long predictable runs in the sequence of taken/not-taken outcomes.
+Random data is slow because that sequence has no pattern. The actual data values are
+irrelevant — only the outcome sequence matters to the predictor.
 
-**Branchless code is not always faster.** For truly unpredictable branches with cheap
-symmetric bodies, the compiler's if-conversion (csinc/csel) produces better code.
-For predictable branches, real branches are faster because speculation is productive.
+**Branchless code (`csinc`/`csel`) is not universally better.** The compiler
+correctly applies if-conversion when both branch paths are cheap to precompute and
+the condition is likely unpredictable. For predictable conditions or expensive
+asymmetric paths, real branches are faster because the predictor makes speculation
+productive and the not-taken path skips significant work. This is a real design
+decision that database, parser, and protocol-processing codebases make explicitly.
 
-**Microbenchmark design requires assembly validation.** The compiler eliminated branches
-in three successive attempts before a valid experiment was achieved. What you write in
-C++ and what the CPU executes can be fundamentally different. Always inspect the assembly
-before trusting timing numbers.
+**Deep speculative execution amplifies misprediction cost.** The M2's large
+out-of-order window (ROB occupancy ~85 cycles per instruction in this loop) means
+that when a branch misprediction is detected, a very deep pipeline full of in-flight
+work must be squashed. The penalty is not just the branch itself — it is the cost of
+discarding dozens of speculative instructions and refilling the pipeline from scratch.
 
-**Stack spills extend the misprediction penalty.** When a hot variable is spilled to
-the stack instead of kept in a register, each misprediction must re-execute a longer
-dependency chain. Register allocation quality directly affects misprediction cost.
+**Stack spills extend the misprediction re-execution penalty.** When a hot accumulator
+is spilled to memory rather than held in a register, the per-iteration dependency
+chain includes a load-store round trip. After a misprediction, this longer chain must
+be re-executed, directly increasing the per-misprediction cost. Register allocation
+quality is not just a code-size concern — it affects misprediction penalty.
+
+**Microbenchmark design requires assembly verification at every step.** The compiler
+eliminated branches in three consecutive attempts using if-conversion before a valid
+measurement was achieved. Each attempt produced plausible-looking source code with
+a genuine conditional — and each produced branchless assembly that measured nothing
+about branch prediction. Only inspecting the generated assembly revealed the issue.
+Source code shows intent; assembly shows what executes.
