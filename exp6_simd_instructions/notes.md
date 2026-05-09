@@ -187,7 +187,7 @@ avg = 1.99896 ns/elem  =  6.65653 cycles/elem
 
 The result is non-trivial (not a compile-time constant), confirming the loop executed.
 The min (4.12 cycles) measures the steady-state cost; the avg (6.66 cycles) is inflated
-by the first run where some data is not yet warm in L2.
+by the first run where some data is not yet warm in L2. The scalar loop exposes this cold-start penalty fully because each load is on the critical path.
 
 ### 3.2 Case 2 -- Auto-Vectorized
 
@@ -201,7 +201,7 @@ avg = 0.129882 ns/elem  =  0.432508 cycles/elem
 Note the result differs slightly from Case 1 (1.05255e6 vs 1.04908e6). This is expected:
 `-ffast-math` allows FP addition reordering, which changes accumulation order and
 introduces different rounding errors. Both results are numerically correct sums; the
-difference is in the last few ULPs.
+difference is in the last few ULPs. The vectorised loops with 4-8 independent accumulators absorb the cold-start latency in the out-of-order window — the penalty is hidden behind the independent accumulator chains
 
 ### 3.3 Case 3 -- Hand-Written NEON (8 Accumulators)
 
@@ -653,6 +653,27 @@ or high-precision scientific code, `-ffast-math` should be used with care.
 The Case 4 kernel does not use `-ffast-math`. The NEON version (Case 4b) achieves
 vectorization purely through intrinsics -- the programmer provides the semantic guarantee
 directly, no flag needed.
+
+### 5.8 Connection to Previous Experiments
+
+Exp6 completes the CPU execution lab series and connects directly to earlier findings:
+
+**Exp1 (ILP):** The scalar accumulator creates a loop-carried dependency — the same
+bottleneck studied in exp1. Vectorisation with multiple accumulators eliminates this
+dependency, applying exp1's lesson at the SIMD level.
+
+**Exp2 (branch prediction):** Case 4a measured 19.7 cycles/elem under ~50% mispredict
+rate — consistent with exp2's finding of 8.4x slowdown from mispredictions. The
+vmaxq_f32 fix is the SIMD equivalent of exp2's sorted-array fix: eliminate the branch
+entirely rather than trying to predict it.
+
+**Exp3 (memory latency):** The L2 bandwidth ceiling of 31 GB/s directly uses exp3's
+measured L2 latency of 16.8 cycles. The vectorised kernels are memory-bound — a
+regime exp3's pointer chase characterised precisely.
+
+**The -fno-vectorize flag** appeared in every experiment from exp1 through exp5,
+deliberately hiding SIMD effects. Exp6 finally removes it and measures what was
+being left on the table: a 9.5x speedup for compute-simple kernels.
 
 ---
 
